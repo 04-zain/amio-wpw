@@ -1,31 +1,24 @@
+import arviz as az
 import pymc as pm
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import arviz as az
 from scipy.special import expit
 import pandas as pd
+from typing import Dict
 import os
-import matplotlib.ticker as mticker
-from scipy.special import expit
-
-# ─── File Directory Path ─────────────────────────────────
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-plots_dir = os.path.join(this_dir, "Outputs_Nested")
-
+plots_dir = os.path.join(this_dir, "Outputs")
 if not os.path.isdir(plots_dir):
-    os.makedirs(plots_dir) 
+    os.makedirs(plots_dir)
 
-# ─── Input Data ───────────────────────────────────────
+# ─── Input Data from Review ─────────────────────────────────────────────
 
-y = np.array([1, 1, 1, 0, 1, 0, 0, 0, 0, 0])        # VF events
-n = np.array([1, 1, 1, 1, 1, 30, 13, 1, 103, 1])    # Number of patients per study
-x = np.array([0, 0, 0, 0, 0, 1, 1, 0, 1, 0])        # 0 = case report, 1 = cohort
-
-N_studies = len(y)
-n_types = len(np.unique(x))
+y = np.array([1, 1, 1, 0, 1, 0, 0, 0, 0, 0])  # VF events
+n = np.array([1, 1, 1, 1, 1, 30, 13, 1, 103, 1])  # Number of patients per study
+x = np.array([0, 0, 0, 0, 0, 1, 1, 0, 1, 0])  # Study type: 0 = case report, 1 = cohort
 
 # ─── Study Labels  ─────────────────────────────────────────────────
 
@@ -39,384 +32,481 @@ study_labels = [
     "Acharya (2020)",
     "Takahira (2020)",
     "Alizadeh (2022)",
-    "Payami (2023)"
+    "Payami (2023)",
 ]
 
-# ─── Bayesian Meta-Regression Model ────────────────────────────────────────────
+N_studies = len(y)
+
+# ─── Bayesian Meta-Regression Model ───────────────────────────────────
 
 with pm.Model() as model:
 
-    # Define global mean log-odds (global intercept)
-    mu = pm.Normal("mu", mu=-9.21, sigma=2.0)
+    mu = pm.Normal("mu", mu=-4.6, sigma=1.16)
+    beta = pm.Normal("beta", mu=0, sigma=2)
+    tau = pm.HalfNormal("tau", sigma=1)
 
-    # Define between-type (accross studies) SD (heterogenity adjustment)
-    sigma = pm.HalfNormal("sigma", sigma=2.0)
-    
-    # Define the non-centered parameterization for type-level effects
-    eta_raw = pm.Normal("eta_raw", mu=0, sigma=1, shape=n_types)
-    eta = pm.Deterministic("eta", eta_raw * sigma)
+    # Non-centered reparameterization for study random effects
+    u_raw = pm.Normal("u_raw", mu=0, sigma=1, shape=N_studies)
+    u = pm.Deterministic("u", u_raw * tau)
 
-    # Define the Within-type (study-level) SD (heterogenity adjustment)
-    tau = pm.HalfNormal("tau", sigma=2.0)
-    
-    # Define the non-centered parameterization for study-level effects
-    zeta_raw = pm.Normal("zeta_raw", mu=0, sigma=1, shape=N_studies)
-    zeta = pm.Deterministic("zeta", zeta_raw * tau)
+    theta = mu + beta * x + u
+    p = pm.Deterministic("p", pm.math.sigmoid(theta))
 
-    # Define the logit equation for each study (cohort or case)
-    logit_p = mu + eta[x] + zeta
-    p = pm.Deterministic("p", pm.math.sigmoid(logit_p))
-
-    # Define the use of a Binomial Likelihood Method
     y_obs = pm.Binomial("y_obs", n=n, p=p, observed=y)
 
-    # Perform Inference 
     trace = pm.sample(
         draws=2000,
         tune=2000,
         chains=4,
         cores=4,
-        init="adapt_diag", # Change the (diagonal) mass matrix during tuning to match the variance of the posterior samples that have been examined thus far
         target_accept=0.99,
-        return_inferencedata=True
+        init="adapt_diag",
+        return_inferencedata=True,
     )
 
-# Determine the uncertainity in the parameters by computing predictions of data based solely on the prior predictive distribution before we have observed any actual data
+# Sample from prior predictive to check prior implications
+
 with model:
-    prior_idata = pm.sample_prior_predictive(
-        samples=1000, 
-        return_inferencedata=True)
+    prior_idata = pm.sample_prior_predictive(samples=1000, return_inferencedata=True)
 
 print(type(prior_idata))
 
-# Determine the distribution of future observations based on the observed data and the posterior distribution of the model parameters (for later model checking against observed data)
+# Sample from posterior predictive
+
 with model:
-    post_pred = pm.sample_posterior_predictive(trace, extend_inferencedata=True, random_seed=9246) # The result of sample_posterior_predictive() is attached into trace under .posterior_predictive via extend_inferencedata for later use in PPC
+    post_pred = pm.sample_posterior_predictive(
+        trace, extend_inferencedata=True, random_seed=92
+    )
 
-# ─── Computation of Paramater Values ───────────────────────────────────────────────
-
-# Define the ratio of observed events from the raw data (count of events divided by sum of patients)
-observed_rate = y.sum() / n.sum()
-
-# Extract the posterior logit probabilities for each study
-mu_samples = trace.posterior["mu"].stack(samples=("chain", "draw")).values          # Shape: (S,) - (8000,)
-eta_samples = trace.posterior["eta"].stack(samples=("chain", "draw")).values        # Shape: (n_types, S) - (2, 8000) 
-zeta_samples = trace.posterior["zeta"].stack(samples=("chain", "draw")).values      # Shape: (n_studies, S) - (10, 8000)
-
-# Compute posterior VF risk for case (x=0) and cohort (x=1)
-vf_case_samples   = expit(mu_samples + eta_samples[0])  # type 0 = case
-vf_cohort_samples = expit(mu_samples + eta_samples[1])  # type 1 = cohort
-
-# Extract the first column of mu_samples to define the total number of posterior samples (chains x draws) 
-mu_shape = mu_samples.shape[0] # mu_shapes should equate to 8000 under current sampling methods (4 chains x 2000 draws)
-
-# Create an empty matrix to hold the computed logit values (log-odds) for each study (with each row a study; each column a posterior sample [draw])
-logits_matrix = np.zeros((N_studies, mu_shape)) 
-
-# Compute the full logit for each study: logit(p_i) = μ + η_type[i] + ζ_i
-for i in range(N_studies):
-    logits_matrix[i] = mu_samples + eta_samples[x[i]] + zeta_samples[i] # eta[x[i]] defines prior_eta row (1 or 2) and zeta[i] defines prior_zeta row (range: 0-9)
-
-# Convert the logit matrix to probabilities (This will form a matrix of posterior probabilities for VF in each study across S posterior draws)
-p_study = expit(logits_matrix)
-
-# Compute an array (weights) where each element is the proportion of patients from that study (patient count in study/total number of patients across all studies)
-weights = n / n.sum()
-
-# Compute a weighted average over the studies (axis=0) for each posterior sample (for each sample S) in Probability Scale
-posterior_weighted = np.average(p_study, axis=0, weights=weights)
-
-# Compute a weighted average over the studies (axis=0) for each posterior sample (for each sample S) in Logit Scale
-posterior_weighted_log = np.log(posterior_weighted / (1 - posterior_weighted))
-
-# Define studies that are only of the cohort-type
-cohort_mask = x == 1  
-
-# Define a new matrix in which we only contain posterior VF probabilities for cohort studies
-p_study_cohort = p_study[cohort_mask] 
-
-# Define a new matrix in which we only contain posterior VF logit values for cohort studies
-l_study_cohort = logits_matrix[cohort_mask] 
-
-#  Compute an array (weights) where each element is the proportion of patients from the cohort study (patient count in study/total number of patients across all studies)
-n_cohort = n[cohort_mask] # The total number of patients in cohort studies
-weights_cohort = n_cohort / n_cohort.sum()
-
-# Compute a weighted average over the cohort studies (axis=0) for each posterior sample (for each sample S) in both logits scale and probability scale
-posterior_weighted_cohort = np.average(p_study_cohort, axis=0, weights=weights_cohort)
-posterior_weighted_cohort_log = np.log(posterior_weighted_cohort / (1 - posterior_weighted_cohort))
+# trace.add_groups(posterior_predictive=post_pred)
 
 # ─── Model Criticism ───────────────────────────────────────────────
 
-# Extract prior samples previously defined "prior_idata"
-prior_mu = prior_idata.prior["mu"].stack(draws=("chain", "draw")).values        # Shape: (8000,)
-prior_eta = prior_idata.prior["eta"].stack(samples=("chain", "draw")).values    # Shape: (2, 8000)
-prior_zeta = prior_idata.prior["zeta"].stack(draws=("chain", "draw")).values    # Shape: (10, 8000)
+# Observed data summary
+observed_rate = y.sum() / n.sum()
 
-# Define a matrix of shape: N (number of studies) for row; S (number of sample) for columns
-prior_logits_matrix = np.zeros((N_studies, prior_mu.shape[0]))
+# Extract weighted posterior (μ + β * x̄) and transform
+posterior_weighted_samples = (
+    expit(trace.posterior["mu"] + trace.posterior["beta"] * np.mean(x))
+    .stack(samples=("chain", "draw"))
+    .values
+)
 
-# Compute prior VF risk on logit scale across all studies in matrix 
-for i in range(N_studies):
-    prior_logits_matrix[i] = prior_mu + prior_eta[x[i]] + prior_zeta[i] # eta[x[i]] defines prior_eta column (1 or 2) and zeta[i] defines prior_zeta column (range: 0-9)
+# Extract prior samples properly
+prior_mu_samples = prior_idata.prior["mu"].stack(draws=("chain", "draw")).values
+prior_beta_samples = prior_idata.prior["beta"].stack(draws=("chain", "draw")).values
 
-# Covert the prior VF risk to probailities scale for log-scale
-prior_vf_risk = expit(prior_logits_matrix) # The shape of the matrix: 
+# Compute prior VF risk on logit scale
+x_mean = np.mean(x)
+prior_logits = prior_mu_samples + prior_beta_samples * x_mean
+prior_vf_risk = expit(prior_logits)
 
-# Filter the prior VF Risk to cohort studies only
-prior_p_study_cohort = prior_vf_risk[cohort_mask] 
-prior_weights_cohort = n[cohort_mask] / np.sum(n[cohort_mask])
+# Plotting
+plt.figure(figsize=(10, 6))
 
-# Compute weighted average VF risk across studies per sample 
-prior_weighted_cohort = np.average(prior_p_study_cohort, axis=0, weights=prior_weights_cohort)
-prior_weighted_cohort_clipped = np.clip(prior_weighted_cohort, -1, 0.05)
-
-# Define the figure size and the use of a sub-axis 
-plt.figure(figsize= (10,6))
-
-# Define kernel density estimation plot for prior distribution of VF risk (μ; logits scale)
+sns.kdeplot(prior_mu_samples, label="Prior (μ)", fill=True, color="gray", alpha=0.4)
 sns.kdeplot(
-    prior_weighted_cohort_clipped, 
-    label="Weighted Cohort Prior (μ)", 
-    fill=True, 
-    color="gray", 
-    alpha=0.4
-    # ax=ax1,
-    )
-
-"""
-# Define kernel density estimation plot for posterior distribution of VF risk across all studies (logit(p_i) = μ + η_type[i] + ζ_i; logits scale)
-sns.kdeplot(
-    posterior_weighted, 
-    label="Weighted Posterior", 
-    fill=True, 
-    color="darkred", 
+    posterior_weighted_samples,
+    label="Posterior (μ + βx)",
+    fill=True,
+    color="red",
     alpha=0.4,
-    ax=ax1
-    )
-"""
-
-# Define kernel density estimation plot for posterior distribution of VF risk across cohort studies (logit(p_i) = μ + η_type[i] + ζ_i; logits scale)
-sns.kdeplot(
-    posterior_weighted_cohort, 
-    label="Weighted Cohort Posterior", 
-    fill=True, 
-    color="red", 
-    alpha=0.4
-    # ax=ax1,
-    )
-
-# Convert the observed event rate to the log-scale for plotting
-observed_rate_log = np.log(observed_rate / (1 - observed_rate))
-
-# Define a line through graph representing the observed event rate 
-plt.axvline(
-    x=observed_rate, 
-    color="black", 
-    linestyle="--", 
-    label="Observed VF Rate"
-    )
-
-# Define labels and legend for kernel density estimation plot
+)
+plt.axvline(x=observed_rate, color="black", linestyle="--", label="Observed VF Rate")
+plt.title("Prior vs Posterior vs Observed VF Risk")
 plt.xlabel("VF Risk")
-plt.ylabel("density")
+plt.ylabel("Density")
 plt.legend()
-plt.grid(False)
+plt.grid(True)
 plt.tight_layout()
 
-# Save the graph to previously defined plots_dir
 plt.savefig(os.path.join(plots_dir, "prior_vs_posterior_vs_observed.png"))
 plt.close()
 
-# ─── Attempt at ECDF Plot Diagnostics ───────────────────────────────────────────────
-
-# Define the figure size and the use of a sub-axis 
-plt.figure(figsize= (10,6))
-
-# Define cumulative distribution frequency plot for posterior distribution of VF risk across cohort studies (logit(p_i) = μ + η_type[i] + ζ_i; logits scale)
-sns.ecdfplot(
-    posterior_weighted_cohort, 
-    label="Cohort Posterior",
-    color = "green"
-    )
-
-# Define cumulative distribution frequency plot for prior distribution of VF risk across cohort studies (logit(p_i) = μ + η_type[i] + ζ_i; logits scale)
-sns.ecdfplot(
-    prior_weighted_cohort, 
-    label="Prior", 
-    color="gray"
-    )
-
-# Define a line through graph representing the observed event rate 
-plt.axvline(
-    observed_rate, 
-    color="black", 
-    linestyle="--", 
-    label="Observed VF Rate")
-
-# Define labels and legend for emperical cumulative distribution frequency plot
-plt.xscale('log')
-plt.xlim(1e-8, 1)
-plt.xlabel("VF Risk (log scale)")
-plt.ylabel("Cumulative Probability")
-plt.legend()
-plt.tight_layout()
-
-
-# Save the graph to previously defined plots_dir
-plt.savefig(os.path.join(plots_dir, "ECF Plot.png"))
-plt.close()
 
 # ─── ArviZ Diagnostics ───────────────────────────────────────────────
 
-# Summarize the posterior distribution of all key parameters
-summary = az.summary(trace, var_names=["mu", "eta", "zeta"], round_to=4)
+import arviz as az
+
+# 1. Summarize key parameters
+summary = az.summary(trace, var_names=["mu", "beta", "tau"], round_to=4)
 ess_rhat = summary[["ess_bulk", "ess_tail", "r_hat"]]
 print(summary)
 
-# Save the posterior distribution summary to a CSV at the previously defined plots_dir
-posterior_csv_path = os.path.join(plots_dir, "ARVIZ Summary")  
+posterior_csv_path = os.path.join(plots_dir, "ARVIZ Summary")
 summary.to_csv(posterior_csv_path, index=False)
 
-# 2. Plot the posterior trace to assess model convergence and mixing
-az.plot_trace(trace, var_names=["mu", "eta", "zeta"])
+# Recalculate and output posterior summaries for each VF risk group
+from scipy.special import expit
+
+# 2. Plot trace to check convergence and mixing
+az.plot_trace(trace, var_names=["mu", "beta", "tau"])
 fig_trace = plt.gcf()
 
-# Save the posterior trace plot to a CSV at the previously defined plots_dir
 trace_path = os.path.join(plots_dir, "az_plot_trace.png")
 fig_trace.savefig(trace_path)
 plt.close(fig_trace)
 
-# 5. Perform a Posterior Predictive Check on the Binomial Data
-az.plot_ppc(trace, num_pp_samples=100) # Trace contains both trace.posterior_predictive["y_obs"] and trace.observed_data["y_obs"] for comparison (due to earlier extension of inference data)
-fig_PPC = plt.gcf()
+# 3. Posterior distributions
+az.plot_posterior(trace, var_names=["mu", "beta", "tau"], hdi_prob=0.95)
+fig_posterior = plt.gcf()
 
-# Save the posterior predictive check to a CSV at the previously defined plots_dir
-PPC_path = os.path.join(plots_dir, "posterior_predictive_check.png")
-fig_PPC.savefig(PPC_path)
+posterior_path = os.path.join(plots_dir, "az_plot_posterior.png")
+fig_posterior.savefig(posterior_path)
+plt.close(fig_posterior)
+
+# 4. Model comparison (if you fit multiple models)
+# az.loo(trace)
+
+# 5. Posterior Predictive Check (optional, if you stored ppc)
+
+az.plot_ppc(trace, num_pp_samples=100)
+plt.title("Posterior Predictive Check1")
+plt.tight_layout()
+plt.savefig(os.path.join(plots_dir, "posterior_predictive_check1.png"))
 plt.close()
 
-# ─── ArivZ Scatter Plot of Change in Prior vs Posterior Probabilitues ──────────────────────
+az.plot_ppc(trace, group="posterior", kind="kde", figsize=(10, 6))
+plt.title("Posterior Predictive Check2")
+plt.tight_layout()
+plt.savefig(os.path.join(plots_dir, "posterior_predictive_check2.png"))
+plt.close()
 
-# Define a dictionary to sort posterior distributions of μ and η
-posterior_dict = {
-    "mu": mu_samples,
-    "eta_case": eta_samples[0],
-    "eta_cohort": eta_samples[1]
-}
 
-# Convert dictionary to ArviZ InferenceData objects
-posterior = az.from_dict (posterior=posterior_dict)
+# ─── 4. Summary Statistics for ESS and R-hat ────────────────────────────────
 
-# Plot a scatter plot of Posterior Distribution using ArivZ InferenceData objects
+ess_rhat = summary[["ess_bulk", "ess_tail", "r_hat"]]
+ess_rhat.to_csv(os.path.join(plots_dir, "ess_rhat_summary.csv"))
+
+# ─── 4. Summary Statistics of Posterior Parameters ────────────────────────────────
+
+ppc_summary = az.summary(trace, var_names=["mu", "beta", "tau"])
+ppc_summary.to_csv(os.path.join(plots_dir, "ppc_summary.csv"))
+
+# ─── Extract Samples for Prior vs Posterior Comparison ───────────────────
+
+# Posterior samples
+mu_samples = trace.posterior["mu"].stack(draws=("chain", "draw")).values
+beta_samples = trace.posterior["beta"].stack(draws=("chain", "draw")).values
+u_samples = trace.posterior["u"].stack(samples=("chain", "draw")).values
+logits_sample = mu_samples + beta_samples * x_mean
+posterior_vf_risk = expit(logits_sample)
+
+S = mu_samples.shape[0]
+mu_mat = np.tile(mu_samples, (N_studies, 1))
+beta_mat = np.tile(beta_samples, (N_studies, 1))
+x_mat = np.tile(x[:, None], (1, S))
+
+theta = mu_mat + beta_mat * x_mat + u_samples
+p_post = expit(theta)
+weighted_posterior = (p_post * n[:, None]).sum(axis=0) / n.sum()
+
+p_new_patient = expit(mu_samples + beta_samples * x_mean)
+
+cohort_mask = x == 1
+
+p_post_cohort = p_post[cohort_mask]  # shape: (n_cohort_studies, n_draws)
+n_cohort = n[cohort_mask][:, None]  # shape: (n_cohort_studies, 1)
+weighted_posterior_cohort_only = (p_post_cohort * n_cohort).sum(axis=0) / n[
+    cohort_mask
+].sum()
+
+# ─── Estimate Prior Distributions ──────────────────────────────────────
+
+prior_mu = prior_idata.prior["mu"].stack(draws=("chain", "draw")).values
+prior_beta = prior_idata.prior["beta"].stack(draws=("chain", "draw")).values
+prior_tau = prior_idata.prior["tau"].stack(samples=("chain", "draw")).values
+
+# ─── Data Proportions (Observed VF/n) ──────────────────────────────────
+
+observed_case_vf = np.array([1, 1, 1, 0, 1, 0, 0, 0, 0, 0])
+observed_case_n = np.array([1, 1, 1, 1, 1, 30, 13, 1, 103, 1])
+case_mask = x == 0
+cohort_mask = x == 1
+case_prop = observed_case_vf[case_mask] / observed_case_n[case_mask]
+cohort_prop = observed_case_vf[cohort_mask] / observed_case_n[cohort_mask]
+# Observed VF rate
+observed_rate = y.sum() / n.sum()
+
+# ─── Posterior Density Plots ─────────────────────────────────────────
+
+plt.figure(figsize=(12, 7))
+
+# Plot Prior vs Posterior vs Observed VF Risk
+plt.figure(figsize=(10, 6))
+sns.kdeplot(prior_vf_risk, label="Prior (μ + βx̄)", fill=True, color="gray", alpha=0.4)
+sns.kdeplot(
+    posterior_vf_risk, label="Posterior (μ + βx̄)", fill=True, color="red", alpha=0.4
+)
+plt.axvline(x=observed_rate, color="black", linestyle="--", label="Observed VF Rate")
+plt.title("Prior vs Posterior vs Observed VF Risk")
+plt.xlabel("VF Risk")
+plt.ylabel("Density")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(os.path.join(plots_dir, "prior_vs_posterior_vs_observed.png"))
+plt.close()
+
+# Final Plot Settings
+plt.xlabel("Estimated VF Risk")
+plt.ylabel("Density")
+plt.grid(True)
+plt.tight_layout()
+
+KDE_plot = os.path.join(plots_dir, "KDE_plot")
+plt.savefig(KDE_plot)
+plt.close()
+
+
+# ─── Posterior Density Plots ─────────────────────────────────────────
+
+# Plot Prior vs Posterior vs Observed VF Risk
+plt.figure(figsize=(10, 6))
+sns.kdeplot(prior_vf_risk, label="Prior (μ + βx̄)", fill=True, color="gray", alpha=0.4)
+sns.kdeplot(
+    posterior_vf_risk, label="Posterior (μ + βx̄)", fill=True, color="red", alpha=0.4
+)
+plt.axvline(x=observed_rate, color="black", linestyle="--", label="Observed VF Rate")
+plt.title("Prior vs Posterior vs Observed VF Risk")
+plt.xlabel("VF Risk")
+plt.ylabel("Density")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(os.path.join(plots_dir, "prior_vs_posterior_vs_observed.png"))
+plt.close()
+
+# Final Plot Settings
+plt.xlabel("Estimated VF Risk")
+plt.ylabel("Density")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+KDE_plot = os.path.join(plots_dir, "KDE_plot")
+plt.savefig(KDE_plot)
+plt.close()
+
+# ─── Spread and change in Variables ─────────────────────────────────────────
+
+n_studies = len(x)
+n_draws = len(mu_samples)
+
+print("mu_samples shape:", mu_samples.shape)
+print("u_samples shape:", u_samples.shape)
+print("beta_samples shape:", beta_samples.shape)
+
+# Compute full log-odds per draw per study:
+log_odds = np.zeros((n_draws, n_studies))
+for i in range(n_studies):
+    log_odds[:, i] = mu_samples + u_samples[i, :] + beta_samples * int(x[i])
+
+# Convert to long format for seaborn
+data = []
+for i in range(n_studies):
+    for d in range(n_draws):
+        data.append(
+            {
+                "study": i,
+                "logit_risk": log_odds[d, i],
+                "type": "Cohort" if x[i] == 1 else "Case Report",
+            }
+        )
+df = pd.DataFrame(data)
+
+# Plot
+
+plt.figure(figsize=(6, 6))
+
+sns.violinplot(data=df, x="type", y="logit_risk")
+
+plt.tight_layout()
+violenplot_path = os.path.join(plots_dir, "interrelation_panels.png")
+plt.savefig(violenplot_path)
+plt.close()
+
+# ___________________________________________________________
+
+import arviz as az
+import numpy as np
+
+posterior_dict = {"mu": mu_samples, "beta": beta_samples}
+
+prior_dict = {"mu": prior_mu, "beta": prior_beta}
+
+prior = az.from_dict(prior=prior_dict)
+posterior = az.from_dict(posterior=posterior_dict)
+
+combined = az.concat(posterior, prior)
+
 az.plot_pair(
-    posterior,
-    var_names=["mu","eta_cohort"],
-    kind='scatter',
+    combined,
+    var_names=["mu", "beta"],
+    kind="scatter",
     marginals=True,
     divergences=False,
-    figsize=(6,6)
+    coords={"chain": [0]},
+    figsize=(6, 6),
 )
 
-# Save the ArivZ scatter plot of posterior distribution
 scatter_posterior = plt.gcf()
-posterior_scatter_path = os.path.join(plots_dir, "az_scatter_posterior.png") 
+
+posterior_scatter_path = os.path.join(plots_dir, "az_scatter.png")
 scatter_posterior.savefig(posterior_scatter_path)
 plt.close(scatter_posterior)
 
-# ─── Seabron Scatter Plot of Change in Prior vs Posterior Probabilitues for μ vs η_cohort ──────────────────────
+# Plot 1: β vs β²
 
-# Create figure size for posterior vs prior plot for μ vs η_cohort using Seaborn
-plt.figure(figsize=(8, 6))
+beta_squared = beta_samples**2
+prior_beta_squared = prior_beta**2
 
-# Define variables for "prior" scatter plot
+plt.figure(figsize=(12, 7))
+
+# Plot 3: β vs u₁
+
+sns.scatterplot(x=prior_beta, y=prior_mu, alpha=0.1, label="Prior", color="blue")
+
 sns.scatterplot(
-    x = prior_eta[1], 
-    y = prior_mu, 
-    alpha=0.2, 
-    label='Prior', 
-    color='blue'
+    x=beta_samples, y=mu_samples, alpha=0.1, label="Posterior", color="green"
 )
 
-# Define variables for "posterior" scatter plot
-sns.scatterplot(
-    x = eta_samples[1], 
-    y = mu_samples, 
-    alpha=0.2, 
-    label='posterior', 
-    color='green'
-)
-
-# Define labels and legend for joint scatter plot
-plt.xlabel("η (Cohort Effect)")
-plt.ylabel("μ (Global Intercept)")
-plt.title("Prior vs Posterior: μ vs η (Cohort)")
+# Final Plot Settings
+plt.xlabel("Beta")
+plt.ylabel("mu")
 plt.legend()
-plt.grid(False)
-plt.tight_layout()
+plt.grid(True)
 
-# Save figure using previously defined plots_dir
-scatter_path = os.path.join(plots_dir, "mu_vs_eta_cohort_prior_posterior.png")
-plt.savefig(scatter_path)
+plt.tight_layout()
+plot_path = os.path.join(plots_dir, "interrelation_panels.png")
+plt.savefig(plot_path)
 plt.close()
 
 # ─── Posterior Risk Summaries ─────────────────────────────────────────
 
-# Define a summary function to compute relevant metrics for each parameter
+
+def summarize(samples: np.ndarray) -> Dict[str, float]:
+    return {
+        "median": np.median(samples),
+        "lower": np.percentile(samples, 2.5),
+        "upper": np.percentile(samples, 97.5),
+    }
+
+
+summary_overall = summarize(weighted_posterior)
+summary_case = summarize(expit(mu_samples))
+summary_cohort = summarize(expit(mu_samples + beta_samples))
+
+# ─── Improved Forest Plot ─────────────────────────────────────────────────────
+
+# Define color schemes
+study_colors = [
+    "#1f77b4" if x_i == 0 else "#ff7f0e" for x_i in x
+]  # blue for case reports, orange for cohort
+palette_violin = {
+    "Case Reports": "#1f77b4",
+    "Cohort Studies": "#ec7813",
+    "Patient-Weighted": "#2ca02c",
+}
+
+fig, ax = plt.subplots(figsize=(10, 6))
+means = p_post.mean(axis=1)
+lower = np.percentile(p_post, 2.5, axis=1)
+upper = np.percentile(p_post, 97.5, axis=1)
+
+for i in range(len(means)):
+    ax.errorbar(
+        means[i],
+        study_labels[i],
+        xerr=[[means[i] - lower[i]], [upper[i] - means[i]]],
+        fmt="o",
+        color=study_colors[i],
+        ecolor=study_colors[i],
+        capsize=3,
+    )
+
+ax.set_xscale("log")
+ax.set_xlabel("Estimated VF Risk (Posterior Mean and 95% CrI)", fontsize=12)
+ax.set_title("Forest Plot of Posterior VF Risk by Study", fontsize=14)
+ax.tick_params(axis="y", labelsize=10)
+ax.grid(True, which="both", ls="--", linewidth=0.5)
+plt.tight_layout()
+
+forest_plot_path = os.path.join(plots_dir, "forest_plot")
+plt.savefig(forest_plot_path)
+plt.close()
+
+# Construct DataFrame of posterior samples
+
+posterior_df = pd.DataFrame(
+    {
+        "VF_risk_case_reports": expit(mu_samples),
+        "VF_risk_cohort_studies": expit(mu_samples + beta_samples),
+        "VF_risk_patient_weighted": weighted_posterior,
+    }
+)
+
+# Save to CSV for analysis or plotting in R/Python
+posterior_csv_path = os.path.join(plots_dir, "posterior data")
+posterior_df.to_csv(posterior_csv_path, index=False)
+
+# Recalculate and output posterior summaries for each VF risk group
+from scipy.special import expit
+
+# Recalculate posterior samples
+vf_case = expit(mu_samples)
+vf_cohort = expit(mu_samples + beta_samples)
+vf_weighted = weighted_posterior
+
+
+# Summarize each group
 def summarize(samples):
     return {
         "median": np.median(samples),
         "lower": np.percentile(samples, 2.5),
-        "upper": np.percentile(samples, 97.5)
+        "upper": np.percentile(samples, 97.5),
     }
 
-# Compute summaries of each parameter using previously defined summary function
-summary_case = summarize(vf_case_samples)
-summary_cohort = summarize(vf_cohort_samples)
-summary_weighted = summarize(posterior_weighted)
-summary_cohort_weighted = summarize(posterior_weighted_cohort)
 
-# Build a summary DataFrame to store all relevant values
-summary_df = pd.DataFrame({
-    "Group": ["Case Reports", "Cohort Studies", "Patient-Weighted Overall", "Cohort Patient-Weighted"],
-    "Median VF Risk": [summary_case["median"], summary_cohort["median"], summary_weighted["median"], summary_cohort_weighted["median"]],
-    "2.5%": [summary_case["lower"], summary_cohort["lower"], summary_weighted["lower"], summary_cohort_weighted["lower"]],
-    "97.5%": [summary_case["upper"], summary_cohort["upper"], summary_weighted["upper"], summary_cohort_weighted["upper"]]
-})
+summary_case = summarize(vf_case)
+summary_cohort = summarize(vf_cohort)
+summary_weighted = summarize(vf_weighted)
+summary_cohort_weighted = summarize(weighted_posterior_cohort_only)
+summary_new_patient = summarize(p_new_patient)
 
-# Save summary CSV using previously defined plots_dir
-summary_csv_path = os.path.join(plots_dir, "summary_data.csv")
+# Construct summary DataFrame
+summary_df = pd.DataFrame(
+    {
+        "Group": [
+            "Case Reports",
+            "Cohort Studies",
+            "Patient-Weighted Overall",
+            "Cohort Patient-Weighted",
+            "New Patient",
+        ],
+        "Median VF Risk": [
+            summary_case["median"],
+            summary_cohort["median"],
+            summary_weighted["median"],
+            summary_cohort_weighted["median"],
+            summary_new_patient["median"],
+        ],
+        "2.5%": [
+            summary_case["lower"],
+            summary_cohort["lower"],
+            summary_weighted["lower"],
+            summary_cohort_weighted["lower"],
+            summary_new_patient["lower"],
+        ],
+        "97.5%": [
+            summary_case["upper"],
+            summary_cohort["upper"],
+            summary_weighted["upper"],
+            summary_cohort_weighted["upper"],
+            summary_new_patient["upper"],
+        ],
+    }
+)
+
+summary_csv_path = os.path.join(plots_dir, "summary data")
 summary_df.to_csv(summary_csv_path, index=False)
-
-# ─── Forst Plot of Posterior Risk Estimate for Each Study ─────────────────────────────────────────
-
-# Set up the Forest plot parameters
-study_colors = ['#1f77b4' if x_i == 0 else '#ff7f0e' for x_i in x]  # blue for case studies' orange for cohort studies
-means = p_study.mean(axis=1)
-lower = np.percentile(p_study, 2.5, axis=1)
-upper = np.percentile(p_study, 97.5, axis=1)
-
-# Define parameters for each study within the forest plot 
-fig, ax = plt.subplots(figsize=(10, 6))
-for i in range(len(means)):
-    ax.errorbar(
-        means[i], 
-        study_labels[i],
-        xerr=[[means[i] - lower[i]], [upper[i] - means[i]]],
-        fmt='o', 
-        color=study_colors[i], 
-        ecolor=study_colors[i], 
-        capsize=3
-        )
-
-# Define labels and legend for the forest plot
-ax.set_xscale("log")
-ax.set_xlabel("Estimated VF Risk (Posterior Mean and 95% CrI)", fontsize=12)
-ax.tick_params(axis='y', labelsize=10)
-ax.grid(True, which="both", ls="--", linewidth=0.5)
-plt.tight_layout()
-
-# Save figure using previously defined plots_dir
-forest_plot_path = os.path.join(plots_dir, "forest_plot.png")
-plt.savefig(forest_plot_path)
-plt.close()
